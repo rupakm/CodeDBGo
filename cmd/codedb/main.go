@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -127,12 +126,12 @@ func runIndex(cmd *cobra.Command, args []string) error {
 		Progress:        progress,
 	}
 
-	if err := db.IndexRepo(context.Background(), url, opts); err != nil {
+	if err := db.IndexRepo(cmd.Context(), url, opts); err != nil {
 		return err
 	}
 
 	// Parse symbols after indexing
-	stats, err := db.ParseSymbols(progress)
+	stats, err := db.ParseSymbols(cmd.Context(), progress)
 	if err != nil {
 		return fmt.Errorf("parse symbols: %w", err)
 	}
@@ -165,7 +164,7 @@ func runSearch(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	results, err := db.Search(query)
+	results, err := db.Search(cmd.Context(), query)
 	if err != nil {
 		return err
 	}

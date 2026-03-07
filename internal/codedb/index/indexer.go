@@ -38,6 +38,36 @@ type BleveDiffDoc struct {
 	Content string `json:"content"`
 }
 
+// commitData holds parsed commit information for indexing.
+type commitData struct {
+	oid       plumbing.Hash
+	author    string
+	message   string
+	timestamp int64
+	treeHash  plumbing.Hash
+	parentIDs []plumbing.Hash
+}
+
+// refInfo holds a resolved ref name and its tip commit hash.
+type refInfo struct {
+	name   string
+	tipOID plumbing.Hash
+}
+
+// indexState holds mutable state shared across indexing sub-operations.
+type indexState struct {
+	tx           *sql.Tx
+	repo         *git.Repository
+	repoID       int64
+	codeBatch    *bleve.Batch
+	diffBatch    *bleve.Batch
+	knownCommits map[string]bool
+	treeCache    map[plumbing.Hash]map[string]plumbing.Hash
+	newCommits   int
+	newBlobs     int
+	report       func(string)
+}
+
 // IndexRepo indexes a git repository into the store.
 func IndexRepo(ctx context.Context, s *store.Store, url string, opts IndexOptions) error {
 	report := func(msg string) {
@@ -58,54 +88,120 @@ func IndexRepo(ctx context.Context, s *store.Store, url string, opts IndexOption
 		return fmt.Errorf("clone/fetch %s: %w", url, err)
 	}
 
-	// 2. Upsert repo
+	// 2. Upsert repo record
 	repoName, err := RepoNameFromURL(url)
 	if err != nil {
 		return err
 	}
-	_, err = s.DB.Exec(
-		`INSERT INTO repos (name, path) VALUES (?, ?)
-		 ON CONFLICT(name) DO UPDATE SET path = excluded.path`,
-		repoName, repoPath,
-	)
+	repoID, err := upsertRepo(s, repoName, repoPath)
 	if err != nil {
-		return fmt.Errorf("upsert repo: %w", err)
-	}
-	var repoID int64
-	err = s.DB.QueryRow("SELECT id FROM repos WHERE name = ?", repoName).Scan(&repoID)
-	if err != nil {
-		return fmt.Errorf("get repo id: %w", err)
+		return err
 	}
 
 	// 3. Load known commits
-	knownCommits := make(map[string]bool)
-	rows, err := s.DB.Query("SELECT hash FROM commits WHERE repo_id = ?", repoID)
+	knownCommits, err := loadKnownCommits(s, repoID)
 	if err != nil {
 		return err
+	}
+
+	// 4. List refs
+	report("Listing refs...")
+	refList, err := listResolvedRefs(repo)
+	if err != nil {
+		return err
+	}
+	report(fmt.Sprintf("Found %d refs.", len(refList)))
+
+	// 5. Begin transaction
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	st := &indexState{
+		tx:           tx,
+		repo:         repo,
+		repoID:       repoID,
+		codeBatch:    s.CodeIndex.NewBatch(),
+		diffBatch:    s.DiffIndex.NewBatch(),
+		knownCommits: knownCommits,
+		treeCache:    make(map[plumbing.Hash]map[string]plumbing.Hash),
+		report:       report,
+	}
+
+	// 6. Process each ref
+	for refIdx, ri := range refList {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := st.processRef(ctx, ri, refIdx, len(refList), opts.MaxHistoryDepth); err != nil {
+			return err
+		}
+	}
+
+	report(fmt.Sprintf("Indexing complete: %d new commits, %d new blobs.", st.newCommits, st.newBlobs))
+
+	// 7. Commit indexes and transaction
+	report("Committing indexes...")
+	if err := s.CodeIndex.Batch(st.codeBatch); err != nil {
+		return fmt.Errorf("commit code index: %w", err)
+	}
+	if err := s.DiffIndex.Batch(st.diffBatch); err != nil {
+		return fmt.Errorf("commit diff index: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// upsertRepo inserts or updates a repo record and returns its ID.
+func upsertRepo(s *store.Store, name, path string) (int64, error) {
+	_, err := s.DB.Exec(
+		`INSERT INTO repos (name, path) VALUES (?, ?)
+		 ON CONFLICT(name) DO UPDATE SET path = excluded.path`,
+		name, path,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("upsert repo: %w", err)
+	}
+	var id int64
+	err = s.DB.QueryRow("SELECT id FROM repos WHERE name = ?", name).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("get repo id: %w", err)
+	}
+	return id, nil
+}
+
+// loadKnownCommits returns a set of commit hashes already indexed for a repo.
+func loadKnownCommits(s *store.Store, repoID int64) (map[string]bool, error) {
+	known := make(map[string]bool)
+	rows, err := s.DB.Query("SELECT hash FROM commits WHERE repo_id = ?", repoID)
+	if err != nil {
+		return nil, err
 	}
 	for rows.Next() {
 		var h string
 		if err := rows.Scan(&h); err != nil {
 			rows.Close()
-			return err
+			return nil, err
 		}
-		knownCommits[h] = true
+		known[h] = true
 	}
 	rows.Close()
+	return known, nil
+}
 
-	// 4. List refs
-	report("Listing refs...")
-	type refInfo struct {
-		name   string
-		tipOID plumbing.Hash
-	}
+// listResolvedRefs returns all refs with symbolic references resolved to their target.
+func listResolvedRefs(repo *git.Repository) ([]refInfo, error) {
 	var refList []refInfo
 	refs, err := repo.References()
 	if err != nil {
-		return fmt.Errorf("list refs: %w", err)
+		return nil, fmt.Errorf("list refs: %w", err)
 	}
 	refs.ForEach(func(ref *plumbing.Reference) error {
-		// Resolve symbolic refs
 		resolved := ref
 		if ref.Type() == plumbing.SymbolicReference {
 			r, err := repo.Reference(ref.Name(), true)
@@ -120,289 +216,296 @@ func IndexRepo(ctx context.Context, s *store.Store, url string, opts IndexOption
 		})
 		return nil
 	})
-	report(fmt.Sprintf("Found %d refs.", len(refList)))
+	return refList, nil
+}
 
-	// 5. Begin transaction
-	tx, err := s.DB.BeginTx(ctx, nil)
+// walkNewCommits discovers commits reachable from tip that aren't in knownCommits.
+// Returns commits in oldest-first order. Respects maxDepth (0 = unlimited).
+func walkNewCommits(repo *git.Repository, tip plumbing.Hash, knownCommits map[string]bool, maxDepth int) ([]commitData, bool) {
+	var newCommits []commitData
+	visited := make(map[plumbing.Hash]bool)
+	walkStack := []plumbing.Hash{tip}
+	depthTruncated := false
+
+	for len(walkStack) > 0 {
+		if maxDepth > 0 && len(newCommits) >= maxDepth {
+			depthTruncated = true
+			break
+		}
+		oid := walkStack[len(walkStack)-1]
+		walkStack = walkStack[:len(walkStack)-1]
+
+		oidHex := oid.String()
+		if knownCommits[oidHex] || visited[oid] {
+			continue
+		}
+		visited[oid] = true
+
+		commitObj, err := repo.CommitObject(oid)
+		if err != nil {
+			continue
+		}
+
+		var parentIDs []plumbing.Hash
+		for _, p := range commitObj.ParentHashes {
+			parentIDs = append(parentIDs, p)
+			walkStack = append(walkStack, p)
+		}
+
+		newCommits = append(newCommits, commitData{
+			oid:       oid,
+			author:    commitObj.Author.Name,
+			message:   commitObj.Message,
+			timestamp: commitObj.Author.When.Unix(),
+			treeHash:  commitObj.TreeHash,
+			parentIDs: parentIDs,
+		})
+	}
+
+	// Reverse for oldest-first processing
+	for i, j := 0, len(newCommits)-1; i < j; i, j = i+1, j-1 {
+		newCommits[i], newCommits[j] = newCommits[j], newCommits[i]
+	}
+
+	return newCommits, depthTruncated
+}
+
+// processRef walks a single ref's history and indexes new commits, diffs, and file_revs.
+func (st *indexState) processRef(ctx context.Context, ri refInfo, refIdx, totalRefs, maxDepth int) error {
+	newCommits, depthTruncated := walkNewCommits(st.repo, ri.tipOID, st.knownCommits, maxDepth)
+
+	if len(newCommits) > 0 {
+		st.report(fmt.Sprintf("Ref %d/%d: %s — %d new commits",
+			refIdx+1, totalRefs, ri.name, len(newCommits)))
+	}
+	if depthTruncated {
+		st.report(fmt.Sprintf("Warning: history depth limit (%d) reached for ref %s.",
+			maxDepth, ri.name))
+	}
+
+	for _, cd := range newCommits {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := st.indexCommit(cd); err != nil {
+			return err
+		}
+	}
+
+	// Build file_revs for tip
+	return st.buildTipFileRevs(ri)
+}
+
+// indexCommit inserts a single commit and its diffs into the database and Bleve.
+func (st *indexState) indexCommit(cd commitData) error {
+	oidHex := cd.oid.String()
+
+	_, err := st.tx.Exec(
+		`INSERT OR IGNORE INTO commits (repo_id, hash, author, message, timestamp)
+		 VALUES (?, ?, ?, ?, ?)`,
+		st.repoID, oidHex, cd.author, cd.message, cd.timestamp,
+	)
 	if err != nil {
+		return fmt.Errorf("insert commit: %w", err)
+	}
+
+	var commitDBID int64
+	err = st.tx.QueryRow("SELECT id FROM commits WHERE hash = ?", oidHex).Scan(&commitDBID)
+	if err != nil {
+		return fmt.Errorf("get commit id: %w", err)
+	}
+
+	st.newCommits++
+	if st.newCommits%500 == 0 {
+		st.report(fmt.Sprintf("Processed %d commits, %d new blobs...", st.newCommits, st.newBlobs))
+	}
+
+	// Insert parent links
+	if err := st.insertParentLinks(commitDBID, cd.parentIDs); err != nil {
 		return err
 	}
-	defer tx.Rollback()
 
-	codeBatch := s.CodeIndex.NewBatch()
-	diffBatch := s.DiffIndex.NewBatch()
+	// Evict tree cache periodically to bound memory usage.
+	// 32 entries ≈ 32 full tree snapshots; keeps memory reasonable for large repos
+	// while avoiding re-parsing recently seen trees.
+	if len(st.treeCache) >= 32 {
+		st.treeCache = make(map[plumbing.Hash]map[string]plumbing.Hash)
+	}
 
-	var totalNewCommits, totalNewBlobs int
-	treeCache := make(map[plumbing.Hash]map[string]plumbing.Hash)
+	childEntries, err := getTreeEntries(st.repo, cd.treeHash, st.treeCache)
+	if err != nil {
+		return fmt.Errorf("get tree entries: %w", err)
+	}
 
-	// 6. For each ref
-	for refIdx, ri := range refList {
-		// Walk ancestors from tip
-		type commitData struct {
-			oid       plumbing.Hash
-			author    string
-			message   string
-			timestamp int64
-			treeHash  plumbing.Hash
-			parentIDs []plumbing.Hash
+	parentEntries := make(map[string]plumbing.Hash)
+	if len(cd.parentIDs) > 0 {
+		parentCommit, pErr := st.repo.CommitObject(cd.parentIDs[0])
+		if pErr == nil {
+			if pe, peErr := getTreeEntries(st.repo, parentCommit.TreeHash, st.treeCache); peErr == nil {
+				parentEntries = pe
+			}
 		}
-		var newCommits []commitData
-		visited := make(map[plumbing.Hash]bool)
-		walkStack := []plumbing.Hash{ri.tipOID}
-		depthTruncated := false
+	}
 
-		for len(walkStack) > 0 {
-			if opts.MaxHistoryDepth > 0 && len(newCommits) >= opts.MaxHistoryDepth {
-				depthTruncated = true
-				break
+	// Index changed and new files
+	if err := st.indexChangedFiles(commitDBID, childEntries, parentEntries); err != nil {
+		return err
+	}
+
+	// Index deleted files
+	if err := st.indexDeletedFiles(commitDBID, childEntries, parentEntries); err != nil {
+		return err
+	}
+
+	st.knownCommits[oidHex] = true
+	return nil
+}
+
+// insertParentLinks records commit parent relationships.
+func (st *indexState) insertParentLinks(commitDBID int64, parentIDs []plumbing.Hash) error {
+	for _, parentOID := range parentIDs {
+		var parentDBID int64
+		err := st.tx.QueryRow("SELECT id FROM commits WHERE hash = ?", parentOID.String()).Scan(&parentDBID)
+		if err == nil {
+			if _, err := st.tx.Exec("INSERT OR IGNORE INTO commit_parents (commit_id, parent_id) VALUES (?, ?)",
+				commitDBID, parentDBID); err != nil {
+				return fmt.Errorf("insert commit parent: %w", err)
 			}
-			oid := walkStack[len(walkStack)-1]
-			walkStack = walkStack[:len(walkStack)-1]
-
-			oidHex := oid.String()
-			if knownCommits[oidHex] || visited[oid] {
-				continue
-			}
-			visited[oid] = true
-
-			commitObj, err := repo.CommitObject(oid)
-			if err != nil {
-				continue // skip non-commit objects
-			}
-
-			var parentIDs []plumbing.Hash
-			for _, p := range commitObj.ParentHashes {
-				parentIDs = append(parentIDs, p)
-				walkStack = append(walkStack, p)
-			}
-
-			newCommits = append(newCommits, commitData{
-				oid:       oid,
-				author:    commitObj.Author.Name,
-				message:   commitObj.Message,
-				timestamp: commitObj.Author.When.Unix(),
-				treeHash:  commitObj.TreeHash,
-				parentIDs: parentIDs,
-			})
 		}
+	}
+	return nil
+}
 
-		// Reverse for oldest-first processing
-		for i, j := 0, len(newCommits)-1; i < j; i, j = i+1, j-1 {
-			newCommits[i], newCommits[j] = newCommits[j], newCommits[i]
+// indexChangedFiles processes files that were added or modified in a commit.
+func (st *indexState) indexChangedFiles(commitDBID int64, childEntries, parentEntries map[string]plumbing.Hash) error {
+	for path, childBlobOID := range childEntries {
+		parentBlobOID, existsInParent := parentEntries[path]
+		if existsInParent && parentBlobOID == childBlobOID {
+			continue // unchanged
 		}
 
-		if len(newCommits) > 0 {
-			report(fmt.Sprintf("Ref %d/%d: %s — %d new commits",
-				refIdx+1, len(refList), ri.name, len(newCommits)))
-		}
-		if depthTruncated {
-			report(fmt.Sprintf("Warning: history depth limit (%d) reached for ref %s.",
-				opts.MaxHistoryDepth, ri.name))
-		}
-
-		for _, cd := range newCommits {
-			oidHex := cd.oid.String()
-
-			// Insert commit
-			_, err := tx.Exec(
-				`INSERT OR IGNORE INTO commits (repo_id, hash, author, message, timestamp)
-				 VALUES (?, ?, ?, ?, ?)`,
-				repoID, oidHex, cd.author, cd.message, cd.timestamp,
-			)
-			if err != nil {
-				return fmt.Errorf("insert commit: %w", err)
-			}
-
-			var commitDBID int64
-			err = tx.QueryRow("SELECT id FROM commits WHERE hash = ?", oidHex).Scan(&commitDBID)
-			if err != nil {
-				return fmt.Errorf("get commit id: %w", err)
-			}
-
-			totalNewCommits++
-			if totalNewCommits%500 == 0 {
-				report(fmt.Sprintf("Processed %d commits, %d new blobs...", totalNewCommits, totalNewBlobs))
-			}
-
-			// Insert parents
-			for _, parentOID := range cd.parentIDs {
-				var parentDBID int64
-				err := tx.QueryRow("SELECT id FROM commits WHERE hash = ?", parentOID.String()).Scan(&parentDBID)
-				if err == nil {
-					if _, err := tx.Exec("INSERT OR IGNORE INTO commit_parents (commit_id, parent_id) VALUES (?, ?)",
-						commitDBID, parentDBID); err != nil {
-						return fmt.Errorf("insert commit parent: %w", err)
-					}
-				}
-			}
-
-			// Get tree entries (with cache)
-			if len(treeCache) >= 32 {
-				treeCache = make(map[plumbing.Hash]map[string]plumbing.Hash)
-			}
-			childEntries, err := getTreeEntries(repo, cd.treeHash, treeCache)
-			if err != nil {
-				return fmt.Errorf("get tree entries: %w", err)
-			}
-
-			parentEntries := make(map[string]plumbing.Hash)
-			if len(cd.parentIDs) > 0 {
-				parentCommit, pErr := repo.CommitObject(cd.parentIDs[0])
-				if pErr == nil {
-					if pe, peErr := getTreeEntries(repo, parentCommit.TreeHash, treeCache); peErr == nil {
-						parentEntries = pe
-					}
-				}
-			}
-
-			// Find changed files
-			for path, childBlobOID := range childEntries {
-				parentBlobOID, existsInParent := parentEntries[path]
-				if existsInParent && parentBlobOID == childBlobOID {
-					continue // unchanged
-				}
-
-				// Ensure new blob
-				newBlobDBID, isNew, err := ensureBlob(tx, repo, childBlobOID, path, codeBatch)
-				if err != nil {
-					return err
-				}
-				if isNew {
-					totalNewBlobs++
-				}
-
-				// Ensure old blob if exists
-				var oldBlobDBID sql.NullInt64
-				if existsInParent {
-					id, isNew, err := ensureBlob(tx, repo, parentBlobOID, path, codeBatch)
-					if err != nil {
-						return err
-					}
-					if isNew {
-						totalNewBlobs++
-					}
-					oldBlobDBID = sql.NullInt64{Int64: id, Valid: true}
-				}
-
-				// Insert diff
-				_, err = tx.Exec(
-					`INSERT OR IGNORE INTO diffs (commit_id, path, old_blob_id, new_blob_id)
-					 VALUES (?, ?, ?, ?)`,
-					commitDBID, path, oldBlobDBID, newBlobDBID,
-				)
-				if err != nil {
-					return fmt.Errorf("insert diff: %w", err)
-				}
-
-				var diffDBID int64
-				err = tx.QueryRow("SELECT id FROM diffs WHERE commit_id = ? AND path = ?",
-					commitDBID, path).Scan(&diffDBID)
-				if err != nil {
-					continue
-				}
-
-				// Index diff in Bleve
-				diffText := generateDiffText(repo, path, parentBlobOID, childBlobOID, existsInParent, true)
-				if diffText != "" {
-					diffBatch.Index(fmt.Sprintf("diff_%d", diffDBID), BleveDiffDoc{Content: diffText})
-				}
-			}
-
-			// Handle deleted files
-			for path, parentBlobOID := range parentEntries {
-				if _, exists := childEntries[path]; exists {
-					continue
-				}
-				oldBlobDBID, isNew, err := ensureBlob(tx, repo, parentBlobOID, path, codeBatch)
-				if err != nil {
-					return err
-				}
-				if isNew {
-					totalNewBlobs++
-				}
-				_, err = tx.Exec(
-					`INSERT OR IGNORE INTO diffs (commit_id, path, old_blob_id, new_blob_id)
-					 VALUES (?, ?, ?, NULL)`,
-					commitDBID, path, oldBlobDBID,
-				)
-				if err != nil {
-					continue
-				}
-
-				var diffDBID int64
-				err = tx.QueryRow("SELECT id FROM diffs WHERE commit_id = ? AND path = ?",
-					commitDBID, path).Scan(&diffDBID)
-				if err != nil {
-					continue
-				}
-				diffText := generateDiffText(repo, path, parentBlobOID, plumbing.ZeroHash, true, false)
-				if diffText != "" {
-					diffBatch.Index(fmt.Sprintf("diff_%d", diffDBID), BleveDiffDoc{Content: diffText})
-				}
-			}
-
-			knownCommits[oidHex] = true
-		}
-
-		// Build file_revs for tip
-		tipHex := ri.tipOID.String()
-		var tipCommitDBID int64
-		err = tx.QueryRow("SELECT id FROM commits WHERE hash = ?", tipHex).Scan(&tipCommitDBID)
+		newBlobDBID, indexed, err := ensureBlob(st.tx, st.repo, childBlobOID, path, st.codeBatch)
 		if err != nil {
-			continue // skip if tip not indexed
+			return err
+		}
+		if indexed {
+			st.newBlobs++
 		}
 
-		if _, err := tx.Exec("DELETE FROM file_revs WHERE commit_id = ?", tipCommitDBID); err != nil {
-			return fmt.Errorf("delete file_revs: %w", err)
-		}
-
-		var tipEntries map[string]plumbing.Hash
-		tipCommit, tErr := repo.CommitObject(ri.tipOID)
-		if tErr == nil {
-			tipEntries, _ = getTreeEntries(repo, tipCommit.TreeHash, treeCache)
-		}
-		if tipEntries == nil {
-			tipEntries = make(map[string]plumbing.Hash)
-		}
-
-		for path, blobOID := range tipEntries {
-			blobDBID, isNew, err := ensureBlob(tx, repo, blobOID, path, codeBatch)
+		var oldBlobDBID sql.NullInt64
+		if existsInParent {
+			id, indexed, err := ensureBlob(st.tx, st.repo, parentBlobOID, path, st.codeBatch)
 			if err != nil {
-				continue
+				return err
 			}
-			if isNew {
-				totalNewBlobs++
+			if indexed {
+				st.newBlobs++
 			}
-			if _, err := tx.Exec("INSERT OR IGNORE INTO file_revs (commit_id, path, blob_id) VALUES (?, ?, ?)",
-				tipCommitDBID, path, blobDBID); err != nil {
-				return fmt.Errorf("insert file_rev: %w", err)
-			}
+			oldBlobDBID = sql.NullInt64{Int64: id, Valid: true}
 		}
 
-		// Upsert ref
-		if _, err := tx.Exec(
-			`INSERT INTO refs (repo_id, name, commit_id) VALUES (?, ?, ?)
-			 ON CONFLICT(repo_id, name) DO UPDATE SET commit_id = excluded.commit_id`,
-			repoID, ri.name, tipCommitDBID,
-		); err != nil {
-			return fmt.Errorf("upsert ref: %w", err)
+		if err := st.insertDiff(commitDBID, path, oldBlobDBID, newBlobDBID, parentBlobOID, childBlobOID, existsInParent, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// indexDeletedFiles processes files that were removed in a commit.
+func (st *indexState) indexDeletedFiles(commitDBID int64, childEntries, parentEntries map[string]plumbing.Hash) error {
+	for path, parentBlobOID := range parentEntries {
+		if _, exists := childEntries[path]; exists {
+			continue
+		}
+		oldBlobDBID, indexed, err := ensureBlob(st.tx, st.repo, parentBlobOID, path, st.codeBatch)
+		if err != nil {
+			return err
+		}
+		if indexed {
+			st.newBlobs++
+		}
+
+		nullBlob := sql.NullInt64{}
+		if err := st.insertDiff(commitDBID, path, sql.NullInt64{Int64: oldBlobDBID, Valid: true}, nullBlob.Int64, parentBlobOID, plumbing.ZeroHash, true, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// insertDiff inserts a diff record and indexes the diff text in Bleve.
+func (st *indexState) insertDiff(commitDBID int64, path string, oldBlobDBID sql.NullInt64, newBlobDBID int64, oldOID, newOID plumbing.Hash, hasOld, hasNew bool) error {
+	var newBlobPtr interface{}
+	if hasNew {
+		newBlobPtr = newBlobDBID
+	}
+
+	_, err := st.tx.Exec(
+		`INSERT OR IGNORE INTO diffs (commit_id, path, old_blob_id, new_blob_id)
+		 VALUES (?, ?, ?, ?)`,
+		commitDBID, path, oldBlobDBID, newBlobPtr,
+	)
+	if err != nil {
+		return fmt.Errorf("insert diff: %w", err)
+	}
+
+	var diffDBID int64
+	err = st.tx.QueryRow("SELECT id FROM diffs WHERE commit_id = ? AND path = ?",
+		commitDBID, path).Scan(&diffDBID)
+	if err != nil {
+		return nil // non-fatal: skip Bleve indexing for this diff
+	}
+
+	diffText := generateDiffText(st.repo, path, oldOID, newOID, hasOld, hasNew)
+	if diffText != "" {
+		st.diffBatch.Index(fmt.Sprintf("diff_%d", diffDBID), BleveDiffDoc{Content: diffText})
+	}
+	return nil
+}
+
+// buildTipFileRevs rebuilds the file_revs table for a ref's tip commit.
+func (st *indexState) buildTipFileRevs(ri refInfo) error {
+	tipHex := ri.tipOID.String()
+	var tipCommitDBID int64
+	err := st.tx.QueryRow("SELECT id FROM commits WHERE hash = ?", tipHex).Scan(&tipCommitDBID)
+	if err != nil {
+		return nil // skip if tip not indexed
+	}
+
+	if _, err := st.tx.Exec("DELETE FROM file_revs WHERE commit_id = ?", tipCommitDBID); err != nil {
+		return fmt.Errorf("delete file_revs: %w", err)
+	}
+
+	var tipEntries map[string]plumbing.Hash
+	tipCommit, tErr := st.repo.CommitObject(ri.tipOID)
+	if tErr == nil {
+		tipEntries, _ = getTreeEntries(st.repo, tipCommit.TreeHash, st.treeCache)
+	}
+	if tipEntries == nil {
+		tipEntries = make(map[string]plumbing.Hash)
+	}
+
+	for path, blobOID := range tipEntries {
+		blobDBID, indexed, err := ensureBlob(st.tx, st.repo, blobOID, path, st.codeBatch)
+		if err != nil {
+			continue
+		}
+		if indexed {
+			st.newBlobs++
+		}
+		if _, err := st.tx.Exec("INSERT OR IGNORE INTO file_revs (commit_id, path, blob_id) VALUES (?, ?, ?)",
+			tipCommitDBID, path, blobDBID); err != nil {
+			return fmt.Errorf("insert file_rev: %w", err)
 		}
 	}
 
-	report(fmt.Sprintf("Indexing complete: %d new commits, %d new blobs.", totalNewCommits, totalNewBlobs))
-
-	// Commit Bleve batches
-	report("Committing indexes...")
-	if err := s.CodeIndex.Batch(codeBatch); err != nil {
-		return fmt.Errorf("commit code index: %w", err)
-	}
-	if err := s.DiffIndex.Batch(diffBatch); err != nil {
-		return fmt.Errorf("commit diff index: %w", err)
-	}
-
-	// Commit SQLite transaction
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit transaction: %w", err)
+	// Upsert ref
+	if _, err := st.tx.Exec(
+		`INSERT INTO refs (repo_id, name, commit_id) VALUES (?, ?, ?)
+		 ON CONFLICT(repo_id, name) DO UPDATE SET commit_id = excluded.commit_id`,
+		st.repoID, ri.name, tipCommitDBID,
+	); err != nil {
+		return fmt.Errorf("upsert ref: %w", err)
 	}
 
 	return nil
@@ -432,8 +535,9 @@ func getTreeEntries(repo *git.Repository, treeHash plumbing.Hash, cache map[plum
 	return entries, nil
 }
 
-// ensureBlob inserts a blob if not already present and indexes it in Bleve.
-// Returns (blobDBID, isNew, error).
+// ensureBlob inserts a blob record if not already present and indexes its content
+// in Bleve if it hasn't been indexed yet (parsed == 0).
+// Returns (blobDBID, indexedInBleve, error).
 func ensureBlob(tx *sql.Tx, repo *git.Repository, blobOID plumbing.Hash, path string, codeBatch *bleve.Batch) (int64, bool, error) {
 	contentHash := blobOID.String()
 	lang := language.Detect(path)
@@ -457,19 +561,10 @@ func ensureBlob(tx *sql.Tx, repo *git.Repository, blobOID plumbing.Hash, path st
 		return 0, false, fmt.Errorf("get blob id: %w", err)
 	}
 
-	// Check if this was newly inserted by trying to read the content
-	// We use a simple heuristic: try to index and if the blob already has an ID, it might be old.
-	// Actually, we check changes via the result: if the blob was INSERT OR IGNORE'd and already existed,
-	// we don't need to re-index. We detect this by checking if the ID was already in our batch.
-	// Simplification: always check if we've already indexed this content_hash before.
-
-	// For simplicity in Go, we track this with a query
 	var parsed int
 	tx.QueryRow("SELECT parsed FROM blobs WHERE id = ?", blobDBID).Scan(&parsed)
 
-	isNew := false
-	// We check if we need to index this blob by seeing if it's the first time we encounter it
-	// Use a simpler approach: try to get blob content only for new inserts
+	indexed := false
 	blobObj, bErr := repo.BlobObject(blobOID)
 	if bErr == nil && parsed == 0 {
 		reader, rErr := blobObj.Reader()
@@ -478,60 +573,65 @@ func ensureBlob(tx *sql.Tx, repo *git.Repository, blobOID plumbing.Hash, path st
 			reader.Close()
 			if readErr == nil && utf8.Valid(content) && len(content) > 0 {
 				codeBatch.Index(fmt.Sprintf("blob_%d", blobDBID), BleveCodeDoc{Content: string(content)})
-				isNew = true
+				indexed = true
 			}
 		}
 	}
 
-	return blobDBID, isNew, nil
+	return blobDBID, indexed, nil
 }
 
 // generateDiffText creates simple diff text for full-text search indexing.
+// Each side is truncated to 100 lines to keep the index manageable.
 func generateDiffText(repo *git.Repository, path string, oldOID, newOID plumbing.Hash, hasOld, hasNew bool) string {
+	const maxLines = 100
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "--- a/%s\n+++ b/%s\n", path, path)
 
 	if hasOld && oldOID != (plumbing.Hash{}) {
-		blob, err := repo.BlobObject(oldOID)
-		if err == nil {
-			reader, err := blob.Reader()
-			if err == nil {
-				content, err := io.ReadAll(reader)
-				reader.Close()
-				if err == nil && utf8.Valid(content) {
-					lines := strings.SplitN(string(content), "\n", 101)
-					for i, line := range lines {
-						if i >= 100 {
-							break
-						}
-						fmt.Fprintf(&b, "-%s\n", line)
-					}
+		if text := readBlobText(repo, oldOID); text != "" {
+			lines := strings.SplitN(text, "\n", maxLines+1)
+			for i, line := range lines {
+				if i >= maxLines {
+					break
 				}
+				fmt.Fprintf(&b, "-%s\n", line)
 			}
 		}
 	}
 
 	if hasNew && newOID != (plumbing.Hash{}) {
-		blob, err := repo.BlobObject(newOID)
-		if err == nil {
-			reader, err := blob.Reader()
-			if err == nil {
-				content, err := io.ReadAll(reader)
-				reader.Close()
-				if err == nil && utf8.Valid(content) {
-					lines := strings.SplitN(string(content), "\n", 101)
-					for i, line := range lines {
-						if i >= 100 {
-							break
-						}
-						fmt.Fprintf(&b, "+%s\n", line)
-					}
+		if text := readBlobText(repo, newOID); text != "" {
+			lines := strings.SplitN(text, "\n", maxLines+1)
+			for i, line := range lines {
+				if i >= maxLines {
+					break
 				}
+				fmt.Fprintf(&b, "+%s\n", line)
 			}
 		}
 	}
 
 	return b.String()
+}
+
+// readBlobText reads a blob's content as a string, returning "" if unreadable or binary.
+func readBlobText(repo *git.Repository, oid plumbing.Hash) string {
+	blob, err := repo.BlobObject(oid)
+	if err != nil {
+		return ""
+	}
+	reader, err := blob.Reader()
+	if err != nil {
+		return ""
+	}
+	content, err := io.ReadAll(reader)
+	reader.Close()
+	if err != nil || !utf8.Valid(content) {
+		return ""
+	}
+	return string(content)
 }
 
 // ParseStats holds statistics from the symbol parsing phase.
@@ -542,7 +642,7 @@ type ParseStats struct {
 
 // ParseSymbols extracts symbols and references from all unparsed blobs with
 // supported languages and inserts them into the symbols and symbol_refs tables.
-func ParseSymbols(s *store.Store, progress ProgressFunc) (ParseStats, error) {
+func ParseSymbols(ctx context.Context, s *store.Store, progress ProgressFunc) (ParseStats, error) {
 	report := func(msg string) {
 		if progress != nil {
 			progress(msg)
@@ -551,13 +651,11 @@ func ParseSymbols(s *store.Store, progress ProgressFunc) (ParseStats, error) {
 
 	var stats ParseStats
 
-	// Collect supported languages into a set for the query placeholder.
 	supported := symbols.SupportedLanguages()
 	if len(supported) == 0 {
 		return stats, nil
 	}
 
-	// Build placeholders for IN clause.
 	placeholders := make([]string, len(supported))
 	args := make([]interface{}, len(supported))
 	for i, lang := range supported {
@@ -566,7 +664,6 @@ func ParseSymbols(s *store.Store, progress ProgressFunc) (ParseStats, error) {
 	}
 	inClause := strings.Join(placeholders, ", ")
 
-	// Query unparsed blobs with a supported language.
 	query := fmt.Sprintf(
 		"SELECT id, content_hash, language FROM blobs WHERE parsed = 0 AND language IN (%s)",
 		inClause,
@@ -598,7 +695,6 @@ func ParseSymbols(s *store.Store, progress ProgressFunc) (ParseStats, error) {
 	}
 	report(fmt.Sprintf("Found %d unparsed blobs with supported languages.", len(blobs)))
 
-	// Collect repo paths.
 	repoRows, err := s.DB.Query("SELECT path FROM repos")
 	if err != nil {
 		return stats, fmt.Errorf("query repo paths: %w", err)
@@ -618,7 +714,6 @@ func ParseSymbols(s *store.Store, progress ProgressFunc) (ParseStats, error) {
 		return stats, fmt.Errorf("no repos found in database")
 	}
 
-	// Open git repos.
 	var repos []*git.Repository
 	for _, rp := range repoPaths {
 		r, err := git.PlainOpen(rp)
@@ -631,7 +726,6 @@ func ParseSymbols(s *store.Store, progress ProgressFunc) (ParseStats, error) {
 		return stats, fmt.Errorf("could not open any git repos")
 	}
 
-	// Begin transaction.
 	tx, err := s.DB.Begin()
 	if err != nil {
 		return stats, fmt.Errorf("begin transaction: %w", err)
@@ -639,11 +733,13 @@ func ParseSymbols(s *store.Store, progress ProgressFunc) (ParseStats, error) {
 	defer tx.Rollback()
 
 	for i, blob := range blobs {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
 		if (i+1)%100 == 0 {
 			report(fmt.Sprintf("Parsing symbols: %d/%d blobs...", i+1, len(blobs)))
 		}
 
-		// Read blob content from git repos by OID (content_hash).
 		oid := plumbing.NewHash(blob.contentHash)
 		var content []byte
 		for _, r := range repos {
@@ -665,14 +761,12 @@ func ParseSymbols(s *store.Store, progress ProgressFunc) (ParseStats, error) {
 			break
 		}
 		if content == nil || !utf8.Valid(content) {
-			// Mark as parsed even if we can't read it to avoid re-processing.
 			tx.Exec("UPDATE blobs SET parsed = 1 WHERE id = ?", blob.id)
 			continue
 		}
 
 		syms, refs := symbols.Extract(string(content), blob.language)
 
-		// Insert symbols, tracking their DB IDs for parent resolution and ref linking.
 		symDBIDs := make([]int64, len(syms))
 		for j, sym := range syms {
 			res, err := tx.Exec(
@@ -686,7 +780,6 @@ func ParseSymbols(s *store.Store, progress ProgressFunc) (ParseStats, error) {
 			stats.SymbolsExtracted++
 		}
 
-		// Update parent_id for nested symbols.
 		for j, sym := range syms {
 			if sym.ParentIdx >= 0 && sym.ParentIdx < len(symDBIDs) {
 				_, err := tx.Exec("UPDATE symbols SET parent_id = ? WHERE id = ?",
@@ -697,7 +790,6 @@ func ParseSymbols(s *store.Store, progress ProgressFunc) (ParseStats, error) {
 			}
 		}
 
-		// Insert refs.
 		for _, ref := range refs {
 			var symbolID int64
 			if ref.ContainingSymIdx >= 0 && ref.ContainingSymIdx < len(symDBIDs) {
@@ -712,7 +804,6 @@ func ParseSymbols(s *store.Store, progress ProgressFunc) (ParseStats, error) {
 			}
 		}
 
-		// Mark blob as parsed.
 		_, err = tx.Exec("UPDATE blobs SET parsed = 1 WHERE id = ?", blob.id)
 		if err != nil {
 			return stats, fmt.Errorf("mark blob parsed: %w", err)

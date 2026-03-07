@@ -40,17 +40,17 @@ func (db *DB) IndexRepo(ctx context.Context, url string, opts index.IndexOptions
 }
 
 // ParseSymbols extracts symbols from all unparsed blobs with supported languages.
-func (db *DB) ParseSymbols(progress func(string)) (index.ParseStats, error) {
-	return index.ParseSymbols(db.store, index.ProgressFunc(progress))
+func (db *DB) ParseSymbols(ctx context.Context, progress func(string)) (index.ParseStats, error) {
+	return index.ParseSymbols(ctx, db.store, index.ProgressFunc(progress))
 }
 
 // Search parses and executes a Sourcegraph-style query.
-func (db *DB) Search(input string) ([]search.Result, error) {
+func (db *DB) Search(ctx context.Context, input string) ([]search.Result, error) {
 	query, err := search.ParseQuery(input)
 	if err != nil {
 		return nil, err
 	}
-	return search.Execute(db.store, query)
+	return search.Execute(ctx, db.store, query)
 }
 
 // TranslateQuery parses a query and returns the generated SQL without executing.
@@ -64,7 +64,7 @@ func (db *DB) TranslateQuery(input string) (*search.TranslatedQuery, error) {
 
 // RawSQL executes a raw SQL query and returns results as column-value pairs.
 func (db *DB) RawSQL(query string) ([]string, [][]string, error) {
-	rows, err := db.store.DB.Query(query)
+	rows, err := db.store.Query(query)
 	if err != nil {
 		return nil, nil, fmt.Errorf("execute sql: %w", err)
 	}

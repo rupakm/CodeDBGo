@@ -11,6 +11,8 @@ import (
 )
 
 // Store wraps a SQLite database and a Bleve full-text search index.
+// DB is exported for backward compatibility; prefer Query/Exec/QueryRow methods
+// on Store for new code to reduce direct coupling to the sql.DB.
 type Store struct {
 	DB        *sql.DB
 	CodeIndex bleve.Index
@@ -90,4 +92,19 @@ func openOrCreateBleveIndex(path string) (bleve.Index, error) {
 		return bleve.New(path, mapping)
 	}
 	return idx, err
+}
+
+// Query executes a SQL query and returns the rows.
+func (s *Store) Query(query string, args ...interface{}) (*sql.Rows, error) {
+	return s.DB.Query(query, args...)
+}
+
+// QueryRow executes a SQL query expected to return at most one row.
+func (s *Store) QueryRow(query string, args ...interface{}) *sql.Row {
+	return s.DB.QueryRow(query, args...)
+}
+
+// Exec executes a SQL statement that doesn't return rows.
+func (s *Store) Exec(query string, args ...interface{}) (sql.Result, error) {
+	return s.DB.Exec(query, args...)
 }
