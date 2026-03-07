@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/blevesearch/bleve/v2"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 // Store wraps a SQLite database and Bleve full-text search indexes.
@@ -35,7 +35,7 @@ func Open(root string) (*Store, error) {
 	}
 
 	dbPath := filepath.Join(root, "metadata.db")
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_foreign_keys=on")
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
