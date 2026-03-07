@@ -1,0 +1,28 @@
+{
+  "repo_id": "repo_019cc4d4-3d3c-75ef-a0aa-2b0f3d3eee71",
+  "type": "git",
+  "init_at": "2026-03-06T20:26:09Z",
+  "init_by_email": "rupak.majumdar+sageox@gmail.com",
+  "init_by_name": "Rupak Majumdar",
+  "repo_salt": "47adb15d6880ff0c721e7ac6339c1af4a8ac3d71",
+  "endpoint": "https://sageox.ai",
+  "fingerprint": {
+    "first_commit": "47adb15d6880ff0c721e7ac6339c1af4a8ac3d71",
+    "monthly_checkpoints": {
+      "2026-03": "47adb15d6880ff0c721e7ac6339c1af4a8ac3d71"
+    },
+    "ancestry_samples": [
+      "47adb15d6880ff0c721e7ac6339c1af4a8ac3d71"
+    ],
+    "remote_hashes": [
+      "sha256:d1059b8e65a3d0d72da2d376b9673f5da934eb37222471df2c15c4113a6f7840"
+    ]
+  },
+  "team_urls": {
+    "First Prod Walk of 2/11/26": "https://git.sageox.ai/sageox-team_db9f37hy3x/team-context.git",
+    "SageOx": "https://git.sageox.ai/sageox-team_jihjpfkt8b/team-context.git"
+  },
+  "urls_cached_at": "2026-03-06T20:26:11Z",
+  "version": "0.2.0",
+  "updated_at": "2026-03-06T20:26:11Z"
+}
