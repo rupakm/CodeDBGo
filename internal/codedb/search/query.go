@@ -105,6 +105,8 @@ func ParseQuery(input string) (*ParsedQuery, error) {
 				filters.NegLang = value
 			case !negated && key == "type":
 				switch value {
+				case "code":
+					searchType = SearchTypeCode
 				case "diff":
 					searchType = SearchTypeDiff
 				case "commit":
@@ -112,7 +114,7 @@ func ParseQuery(input string) (*ParsedQuery, error) {
 				case "symbol":
 					searchType = SearchTypeSymbol
 				default:
-					return nil, fmt.Errorf("unknown search type '%s'. Valid types: symbol, diff, commit", value)
+					return nil, fmt.Errorf("unknown search type '%s'. Valid types: code, symbol, diff, commit", value)
 				}
 			case !negated && (key == "rev" || key == "revision"):
 				filters.Rev = value

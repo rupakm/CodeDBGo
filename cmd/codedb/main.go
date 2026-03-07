@@ -50,7 +50,7 @@ var searchCmd = &cobra.Command{
 Filters: repo:, file:, -file:, lang:, type: (code|diff|commit|symbol),
   rev:, count:, case:, author:, before:, after:, message:,
   select: (repo|file|symbol), calls:, calledby:, returns:,
-  patterntype: (literal|regexp), /regex/
+  patterntype: (literal|keyword|regexp), /regex/
 
 Examples:
   codedb search "lang:go func main"

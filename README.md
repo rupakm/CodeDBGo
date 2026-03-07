@@ -20,10 +20,13 @@ repositories and their full history. Embedded, built in Go.
 ## Quick Start
 
 ```bash
-# Build
+# Build (no CGO required — indexing and search work, but no symbol extraction)
 make build
 
-# Index a repository (clones, walks history, extracts symbols)
+# Build with symbol extraction (requires C compiler)
+make build-cgo
+
+# Index a repository (clones, walks history, extracts symbols if CGO build)
 codedb index https://github.com/user/repo
 
 # Search for code (Sourcegraph-style query)
@@ -169,6 +172,10 @@ JOINs, aggregations, and anything else SQLite supports.
 ## Symbol Extraction
 
 CodeDB uses tree-sitter to extract symbols from source code during indexing.
+Symbol extraction requires building with CGO enabled (`make build-cgo`).
+When built without CGO (the default), indexing and search still work but
+symbol-related features (`type:symbol`, `calls:`, `calledby:`, `returns:`)
+return no results.
 
 ### Supported Languages
 
@@ -207,6 +214,7 @@ CodeDB uses tree-sitter to extract symbols from source code during indexing.
 │  │  go-git   │  │  tree-sitter   │  │
 │  │ (git ops) │  │ (symbols,      │  │
 │  │           │  │  call refs)    │  │
+│  │           │  │ CGO only       │  │
 │  └───────────┘  └────────────────┘  │
 ├─────────────────────────────────────┤
 │   Planner (SQL / Bleve / Intersect) │
@@ -283,13 +291,19 @@ ORDER BY file_count DESC
 ## Library Usage
 
 ```go
-import "github.com/sageox/codedbgo/internal/codedb"
+import (
+	"context"
+	"github.com/sageox/codedbgo/internal/codedb"
+	"github.com/sageox/codedbgo/internal/codedb/index"
+)
 
 db, err := codedb.Open("/path/to/data")
 if err != nil {
     log.Fatal(err)
 }
 defer db.Close()
+
+ctx := context.Background()
 
 // Index a repository (clones bare, walks history, extracts symbols)
 err = db.IndexRepo(ctx, "https://github.com/user/repo", index.IndexOptions{})
@@ -298,7 +312,7 @@ err = db.IndexRepo(ctx, "https://github.com/user/repo", index.IndexOptions{})
 err = db.IndexRepo(ctx, "https://github.com/user/repo", index.IndexOptions{})
 
 // Sourcegraph-style search
-results, err := db.Search("lang:rust type:symbol SFrame")
+results, err := db.Search(ctx, "lang:rust type:symbol SFrame")
 
 // Or query via SQL directly
 cols, rows, err := db.RawSQL("SELECT fr.path FROM file_revs fr LIMIT 10")
@@ -307,15 +321,25 @@ cols, rows, err := db.RawSQL("SELECT fr.path FROM file_revs fr LIMIT 10")
 ## Building
 
 ```bash
+# Default build (CGO_ENABLED=0, no tree-sitter symbol extraction)
 make build
+
+# Build with tree-sitter symbol extraction (requires C compiler)
+make build-cgo
 ```
 
-Requires Go 1.21+ and a C compiler (for SQLite and tree-sitter).
-CGO must be enabled (`CGO_ENABLED=1`).
+Requires Go 1.25+. The default build uses `CGO_ENABLED=0` and needs no C
+compiler — SQLite uses a pure-Go driver and symbol extraction is disabled.
+
+To enable tree-sitter symbol extraction, build with `make build-cgo` (requires
+a C compiler for the tree-sitter bindings).
 
 ```bash
-# Run tests
+# Run tests (no CGO)
 make test
+
+# Run all tests including tree-sitter symbol tests
+make test-cgo
 
 # Install to $GOPATH/bin
 make install
