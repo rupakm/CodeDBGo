@@ -54,7 +54,7 @@ func executePlanSQL(ctx context.Context, s *store.Store, plan *ExecutionPlan) ([
 		args[i] = p
 	}
 
-	rows, err := s.DB.QueryContext(ctx, plan.SQL, args...)
+	rows, err := s.QueryContext(ctx, plan.SQL, args...)
 	if err != nil {
 		return nil, fmt.Errorf("execute query: %w", err)
 	}
@@ -178,7 +178,7 @@ func enrichDiffHit(ctx context.Context, s *store.Store, hit *blevesearch.Documen
 		addDiffFilters(&sqlQ, &args, filters)
 	}
 
-	rows, err := s.DB.QueryContext(ctx, sqlQ, args...)
+	rows, err := s.QueryContext(ctx, sqlQ, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -220,7 +220,7 @@ func enrichCodeHit(ctx context.Context, s *store.Store, hit *blevesearch.Documen
 		addCodeFilters(&sqlQ, &args, filters)
 	}
 
-	rows, err := s.DB.QueryContext(ctx, sqlQ, args...)
+	rows, err := s.QueryContext(ctx, sqlQ, args...)
 	if err != nil {
 		return nil, err
 	}

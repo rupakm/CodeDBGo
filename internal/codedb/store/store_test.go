@@ -22,12 +22,12 @@ func TestOpenCreatesStructure(t *testing.T) {
 	}
 
 	// Can insert into repos table
-	_, err = s.DB.Exec("INSERT INTO repos (name, path) VALUES ('test', '/tmp/test')")
+	_, err = s.Exec("INSERT INTO repos (name, path) VALUES ('test', '/tmp/test')")
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 	var count int
-	err = s.DB.QueryRow("SELECT COUNT(*) FROM repos").Scan(&count)
+	err = s.QueryRow("SELECT COUNT(*) FROM repos").Scan(&count)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}

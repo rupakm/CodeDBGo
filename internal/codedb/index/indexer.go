@@ -113,7 +113,7 @@ func IndexRepo(ctx context.Context, s *store.Store, url string, opts IndexOption
 	report(fmt.Sprintf("Found %d refs.", len(refList)))
 
 	// 5. Begin transaction
-	tx, err := s.DB.BeginTx(ctx, nil)
+	tx, err := s.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -159,7 +159,7 @@ func IndexRepo(ctx context.Context, s *store.Store, url string, opts IndexOption
 
 // upsertRepo inserts or updates a repo record and returns its ID.
 func upsertRepo(s *store.Store, name, path string) (int64, error) {
-	_, err := s.DB.Exec(
+	_, err := s.Exec(
 		`INSERT INTO repos (name, path) VALUES (?, ?)
 		 ON CONFLICT(name) DO UPDATE SET path = excluded.path`,
 		name, path,
@@ -168,7 +168,7 @@ func upsertRepo(s *store.Store, name, path string) (int64, error) {
 		return 0, fmt.Errorf("upsert repo: %w", err)
 	}
 	var id int64
-	err = s.DB.QueryRow("SELECT id FROM repos WHERE name = ?", name).Scan(&id)
+	err = s.QueryRow("SELECT id FROM repos WHERE name = ?", name).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("get repo id: %w", err)
 	}
@@ -178,7 +178,7 @@ func upsertRepo(s *store.Store, name, path string) (int64, error) {
 // loadKnownCommits returns a set of commit hashes already indexed for a repo.
 func loadKnownCommits(s *store.Store, repoID int64) (map[string]bool, error) {
 	known := make(map[string]bool)
-	rows, err := s.DB.Query("SELECT hash FROM commits WHERE repo_id = ?", repoID)
+	rows, err := s.Query("SELECT hash FROM commits WHERE repo_id = ?", repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -668,7 +668,7 @@ func ParseSymbols(ctx context.Context, s *store.Store, progress ProgressFunc) (P
 		"SELECT id, content_hash, language FROM blobs WHERE parsed = 0 AND language IN (%s)",
 		inClause,
 	)
-	rows, err := s.DB.Query(query, args...)
+	rows, err := s.Query(query, args...)
 	if err != nil {
 		return stats, fmt.Errorf("query unparsed blobs: %w", err)
 	}
@@ -695,7 +695,7 @@ func ParseSymbols(ctx context.Context, s *store.Store, progress ProgressFunc) (P
 	}
 	report(fmt.Sprintf("Found %d unparsed blobs with supported languages.", len(blobs)))
 
-	repoRows, err := s.DB.Query("SELECT path FROM repos")
+	repoRows, err := s.Query("SELECT path FROM repos")
 	if err != nil {
 		return stats, fmt.Errorf("query repo paths: %w", err)
 	}
@@ -726,7 +726,7 @@ func ParseSymbols(ctx context.Context, s *store.Store, progress ProgressFunc) (P
 		return stats, fmt.Errorf("could not open any git repos")
 	}
 
-	tx, err := s.DB.Begin()
+	tx, err := s.Begin()
 	if err != nil {
 		return stats, fmt.Errorf("begin transaction: %w", err)
 	}

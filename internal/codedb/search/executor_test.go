@@ -38,7 +38,7 @@ func seedTestData(t *testing.T, s *store.Store) {
 		`INSERT INTO symbol_refs (id, blob_id, symbol_id, ref_name, kind, line, col) VALUES (2, 2, 3, 'parse', 'call', 10, 5)`,
 	}
 	for _, stmt := range stmts {
-		if _, err := s.DB.Exec(stmt); err != nil {
+		if _, err := s.Exec(stmt); err != nil {
 			t.Fatalf("seed: %s: %v", stmt, err)
 		}
 	}

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -10,11 +11,10 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-// Store wraps a SQLite database and a Bleve full-text search index.
-// DB is exported for backward compatibility; prefer Query/Exec/QueryRow methods
-// on Store for new code to reduce direct coupling to the sql.DB.
+// Store wraps a SQLite database and Bleve full-text search indexes.
+// All SQL access goes through the convenience methods below.
 type Store struct {
-	DB        *sql.DB
+	db        *sql.DB
 	CodeIndex bleve.Index
 	DiffIndex bleve.Index
 	Root      string
@@ -58,7 +58,7 @@ func Open(root string) (*Store, error) {
 	}
 
 	return &Store{
-		DB:        db,
+		db:        db,
 		CodeIndex: codeIndex,
 		DiffIndex: diffIndex,
 		Root:      root,
@@ -79,7 +79,7 @@ func (s *Store) Close() error {
 	if err := s.DiffIndex.Close(); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	if err := s.DB.Close(); err != nil && firstErr == nil {
+	if err := s.db.Close(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	return firstErr
@@ -94,17 +94,34 @@ func openOrCreateBleveIndex(path string) (bleve.Index, error) {
 	return idx, err
 }
 
+// --- SQL convenience methods ---
+
 // Query executes a SQL query and returns the rows.
 func (s *Store) Query(query string, args ...interface{}) (*sql.Rows, error) {
-	return s.DB.Query(query, args...)
+	return s.db.Query(query, args...)
+}
+
+// QueryContext executes a SQL query with context and returns the rows.
+func (s *Store) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	return s.db.QueryContext(ctx, query, args...)
 }
 
 // QueryRow executes a SQL query expected to return at most one row.
 func (s *Store) QueryRow(query string, args ...interface{}) *sql.Row {
-	return s.DB.QueryRow(query, args...)
+	return s.db.QueryRow(query, args...)
 }
 
 // Exec executes a SQL statement that doesn't return rows.
 func (s *Store) Exec(query string, args ...interface{}) (sql.Result, error) {
-	return s.DB.Exec(query, args...)
+	return s.db.Exec(query, args...)
+}
+
+// BeginTx starts a new transaction with the given context and options.
+func (s *Store) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
+	return s.db.BeginTx(ctx, opts)
+}
+
+// Begin starts a new transaction.
+func (s *Store) Begin() (*sql.Tx, error) {
+	return s.db.Begin()
 }
