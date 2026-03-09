@@ -188,7 +188,8 @@ func queryCandidates(ctx context.Context, s *store.Store, opts MatchOptions, hin
 
 // readBlobContent reads the source text of a blob from the git repo.
 func readBlobContent(s *store.Store, c candidate, repoCache map[string]*git.Repository) (string, error) {
-	fullPath := s.ReposDir() + "/" + c.repoPath
+	// repos.path is stored as an absolute path by the indexer
+	fullPath := c.repoPath
 	repo, ok := repoCache[fullPath]
 	if !ok {
 		var err error
