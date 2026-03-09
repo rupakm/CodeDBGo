@@ -113,3 +113,105 @@ func main() {
 		t.Fatalf("matches = %d, want 1 (only foo(1,2))", len(matches))
 	}
 }
+
+// --- Formula tests ---
+
+func TestFormulaNotExcludes(t *testing.T) {
+	src := `package main
+func main() {
+	foo(1)
+	foo(2)
+	bar(3)
+}`
+	tree, lang := parseGoCode(t, src)
+	m := mapper.NewGoMapper(lang, []byte(src))
+	basePat, _ := pattern.Parse("foo($X)")
+	notPat, _ := pattern.Parse("foo(1)")
+
+	formula := &pattern.And{
+		Formulas: []pattern.MatchFormula{
+			&pattern.BasePattern{Lang: "go", Pattern: basePat},
+			&pattern.Not{Formula: &pattern.BasePattern{Lang: "go", Pattern: notPat}},
+		},
+	}
+	results := ApplyFormula(formula, tree.RootNode(), m)
+	if len(results) != 1 {
+		t.Fatalf("results = %d, want 1 (foo(2) only)", len(results))
+	}
+	if results[0].Bindings["X"] != "2" {
+		t.Errorf("$X = %q, want %q", results[0].Bindings["X"], "2")
+	}
+}
+
+func TestFormulaInside(t *testing.T) {
+	src := `package main
+func safe() { foo(1) }
+func unsafe() { foo(2) }
+`
+	tree, lang := parseGoCode(t, src)
+	m := mapper.NewGoMapper(lang, []byte(src))
+	basePat, _ := pattern.Parse("foo($X)")
+	insidePat, _ := pattern.Parse("func unsafe(...) { ... }")
+
+	formula := &pattern.And{
+		Formulas: []pattern.MatchFormula{
+			&pattern.BasePattern{Lang: "go", Pattern: basePat},
+			&pattern.Inside{Formula: &pattern.BasePattern{Lang: "go", Pattern: insidePat}},
+		},
+	}
+	results := ApplyFormula(formula, tree.RootNode(), m)
+	if len(results) != 1 {
+		t.Fatalf("results = %d, want 1 (foo inside unsafe only)", len(results))
+	}
+	if results[0].Bindings["X"] != "2" {
+		t.Errorf("$X = %q, want %q", results[0].Bindings["X"], "2")
+	}
+}
+
+// --- Constraint tests ---
+
+func TestConstraintRegex(t *testing.T) {
+	results := []MatchResult{
+		{Bindings: map[string]string{"F": "unsafe_exec"}},
+		{Bindings: map[string]string{"F": "safe_run"}},
+		{Bindings: map[string]string{"F": "unsafe_read"}},
+	}
+	constraints := []pattern.MetavarConstraint{
+		{Metavar: "F", Op: "~", Value: "/^unsafe_/"},
+	}
+	filtered := ApplyConstraints(results, constraints)
+	if len(filtered) != 2 {
+		t.Fatalf("filtered = %d, want 2", len(filtered))
+	}
+}
+
+func TestConstraintNotRegex(t *testing.T) {
+	results := []MatchResult{
+		{Bindings: map[string]string{"F": "unsafe_exec"}},
+		{Bindings: map[string]string{"F": "safe_run"}},
+	}
+	constraints := []pattern.MetavarConstraint{
+		{Metavar: "F", Op: "!~", Value: "/^unsafe_/"},
+	}
+	filtered := ApplyConstraints(results, constraints)
+	if len(filtered) != 1 {
+		t.Fatalf("filtered = %d, want 1", len(filtered))
+	}
+	if filtered[0].Bindings["F"] != "safe_run" {
+		t.Errorf("F = %q, want safe_run", filtered[0].Bindings["F"])
+	}
+}
+
+func TestConstraintEqual(t *testing.T) {
+	results := []MatchResult{
+		{Bindings: map[string]string{"X": "nil"}},
+		{Bindings: map[string]string{"X": "0"}},
+	}
+	constraints := []pattern.MetavarConstraint{
+		{Metavar: "X", Op: "==", Value: "nil"},
+	}
+	filtered := ApplyConstraints(results, constraints)
+	if len(filtered) != 1 {
+		t.Fatalf("filtered = %d, want 1", len(filtered))
+	}
+}
