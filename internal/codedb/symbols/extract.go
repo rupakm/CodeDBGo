@@ -1,19 +1,3 @@
-//go:build ignore
-// +build ignore
-
-// symbols_purego.go is a PROOF OF CONCEPT showing what the symbols package
-// would look like after migrating from smacker/go-tree-sitter (CGO) to
-// odvcencio/gotreesitter (pure Go).
-//
-// This file is not compiled (build tag: ignore). It demonstrates the API
-// mapping so the migration effort can be evaluated concretely.
-//
-// To complete the migration:
-//   1. Replace go.mod dependency
-//   2. Delete symbols_cgo.go and symbols_nocgo.go
-//   3. Remove the "ignore" build tag from this file
-//   4. Run tests: go test ./internal/codedb/symbols/...
-
 package symbols
 
 import (
@@ -34,7 +18,7 @@ type languageConfig struct {
 }
 
 // Extract extracts symbol definitions and references from source code
-// for the given language using tree-sitter (pure Go implementation).
+// for the given language using tree-sitter.
 func Extract(source, language string) ([]Symbol, []Ref) {
 	config := getConfig(language)
 	if config == nil {
@@ -93,7 +77,6 @@ func extractDefs(root *gotreesitter.Node, src []byte, config *languageConfig) []
 	nameIdx := captureIndex(q, "name")
 	defIdx := captureIndex(q, "def")
 
-	// Query execution: gotreesitter combines cursor creation and exec
 	cursor := q.Exec(root, config.lang, src)
 
 	var symbols []Symbol
@@ -102,14 +85,12 @@ func extractDefs(root *gotreesitter.Node, src []byte, config *languageConfig) []
 		if !ok {
 			break
 		}
-		// Note: gotreesitter handles predicates internally during matching,
-		// so there is no separate FilterPredicates call needed.
 
 		var nameText string
 		var defNode *gotreesitter.Node
 		for _, cap := range m.Captures {
 			if nameIdx >= 0 && cap.Index == uint32(nameIdx) {
-				nameText = cap.Node.Text(src) // .Content(src) → .Text(src)
+				nameText = cap.Node.Text(src)
 			}
 			if defIdx >= 0 && cap.Index == uint32(defIdx) {
 				defNode = cap.Node
@@ -127,7 +108,7 @@ func extractDefs(root *gotreesitter.Node, src []byte, config *languageConfig) []
 
 		symbols = append(symbols, Symbol{
 			Name:       nameText,
-			Kind:       normalizeKind(defNode.Type(config.lang)), // .Type() → .Type(lang)
+			Kind:       normalizeKind(defNode.Type(config.lang)),
 			Line:       int(start.Row) + 1,
 			Col:        int(start.Column) + 1,
 			EndLine:    int(end.Row) + 1,
@@ -274,7 +255,6 @@ func isFunctionLike(kind string) bool {
 }
 
 // extractTypeInfo extracts signature, return_type, and params from a def node.
-// Note: node.Type() requires lang parameter in gotreesitter.
 func extractTypeInfo(node *gotreesitter.Node, src []byte, config *languageConfig) (string, string, string) {
 	sig := extractSignature(node, src, config.lang)
 

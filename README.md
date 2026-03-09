@@ -20,13 +20,10 @@ repositories and their full history. Embedded, built in Go.
 ## Quick Start
 
 ```bash
-# Build (no CGO required — indexing and search work, but no symbol extraction)
+# Build
 make build
 
-# Build with symbol extraction (requires C compiler)
-make build-cgo
-
-# Index a repository (clones, walks history, extracts symbols if CGO build)
+# Index a repository (clones, walks history, extracts symbols)
 codedb index https://github.com/user/repo
 
 # Search for code (Sourcegraph-style query)
@@ -172,10 +169,8 @@ JOINs, aggregations, and anything else SQLite supports.
 ## Symbol Extraction
 
 CodeDB uses tree-sitter to extract symbols from source code during indexing.
-Symbol extraction requires building with CGO enabled (`make build-cgo`).
-When built without CGO (the default), indexing and search still work but
-symbol-related features (`type:symbol`, `calls:`, `calledby:`, `returns:`)
-return no results.
+Symbol extraction uses a pure Go tree-sitter implementation, so no C compiler
+or CGO is required.
 
 ### Supported Languages
 
@@ -214,7 +209,7 @@ return no results.
 │  │  go-git   │  │  tree-sitter   │  │
 │  │ (git ops) │  │ (symbols,      │  │
 │  │           │  │  call refs)    │  │
-│  │           │  │ CGO only       │  │
+│  │           │  │  pure Go)      │  │
 │  └───────────┘  └────────────────┘  │
 ├─────────────────────────────────────┤
 │   Planner (SQL / Bleve / Intersect) │
@@ -321,29 +316,18 @@ cols, rows, err := db.RawSQL("SELECT fr.path FROM file_revs fr LIMIT 10")
 ## Building
 
 ```bash
-# Default build (CGO_ENABLED=0, no tree-sitter symbol extraction)
+# Build
 make build
 
-# Build with tree-sitter symbol extraction (requires C compiler)
-make build-cgo
-```
-
-Requires Go 1.25+. The default build uses `CGO_ENABLED=0` and needs no C
-compiler — SQLite uses a pure-Go driver and symbol extraction is disabled.
-
-To enable tree-sitter symbol extraction, build with `make build-cgo` (requires
-a C compiler for the tree-sitter bindings).
-
-```bash
-# Run tests (no CGO)
+# Run tests
 make test
-
-# Run all tests including tree-sitter symbol tests
-make test-cgo
 
 # Install to $GOPATH/bin
 make install
 ```
+
+Requires Go 1.25+. The build is fully pure Go — no C compiler or CGO required.
+SQLite uses a pure-Go driver and tree-sitter uses a pure Go implementation.
 
 ## License
 
