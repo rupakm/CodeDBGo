@@ -791,7 +791,7 @@ func ParseSymbols(ctx context.Context, s *store.Store, progress ProgressFunc) (P
 		}
 
 		for _, ref := range refs {
-			var symbolID int64
+			var symbolID interface{}
 			if ref.ContainingSymIdx >= 0 && ref.ContainingSymIdx < len(symDBIDs) {
 				symbolID = symDBIDs[ref.ContainingSymIdx]
 			}

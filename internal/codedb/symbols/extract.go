@@ -1,6 +1,7 @@
 package symbols
 
 import (
+	"regexp"
 	"sort"
 	"strings"
 	"unicode"
@@ -11,10 +12,11 @@ import (
 
 // languageConfig holds tree-sitter query patterns for a language.
 type languageConfig struct {
-	name     string
-	lang     *gotreesitter.Language
-	defQuery string
-	refQuery string
+	name               string
+	lang               *gotreesitter.Language
+	defQuery           string
+	refQuery           string
+	tokenSourceFactory func(src []byte, lang *gotreesitter.Language) gotreesitter.TokenSource
 }
 
 // Extract extracts symbol definitions and references from source code
@@ -26,14 +28,29 @@ func Extract(source, language string) ([]Symbol, []Ref) {
 	}
 
 	parser := gotreesitter.NewParser(config.lang)
-	tree, err := parser.Parse([]byte(source))
+	src := []byte(source)
+	var tree *gotreesitter.Tree
+	var err error
+	if config.tokenSourceFactory != nil {
+		tree, err = parser.ParseWithTokenSource(src, config.tokenSourceFactory(src, config.lang))
+	} else {
+		tree, err = parser.Parse(src)
+	}
 	if err != nil || tree == nil {
 		return nil, nil
 	}
 	defer tree.Release()
 
 	root := tree.RootNode()
-	src := []byte(source)
+
+	// Check for degenerate parse tree (DFA lexer failure).
+	// If root has very few children relative to source size, the parser failed.
+	if root.ChildCount() < 3 && len(src) > 200 {
+		syms, refs := extractRegexFallback(source, language)
+		if len(syms) > 0 {
+			return syms, refs
+		}
+	}
 
 	// Phase 1: extract definition symbols
 	symbols := extractDefs(root, src, config)
@@ -74,9 +91,6 @@ func extractDefs(root *gotreesitter.Node, src []byte, config *languageConfig) []
 		return nil
 	}
 
-	nameIdx := captureIndex(q, "name")
-	defIdx := captureIndex(q, "def")
-
 	cursor := q.Exec(root, config.lang, src)
 
 	var symbols []Symbol
@@ -89,10 +103,10 @@ func extractDefs(root *gotreesitter.Node, src []byte, config *languageConfig) []
 		var nameText string
 		var defNode *gotreesitter.Node
 		for _, cap := range m.Captures {
-			if nameIdx >= 0 && cap.Index == uint32(nameIdx) {
+			if cap.Name == "name" {
 				nameText = cap.Node.Text(src)
 			}
-			if defIdx >= 0 && cap.Index == uint32(defIdx) {
+			if cap.Name == "def" {
 				defNode = cap.Node
 			}
 		}
@@ -126,13 +140,17 @@ func extractDefs(root *gotreesitter.Node, src []byte, config *languageConfig) []
 }
 
 func extractRefs(root *gotreesitter.Node, src []byte, config *languageConfig, symbols []Symbol) []Ref {
+	// Some grammars (C, C++) have duplicate symbol IDs that prevent
+	// query matching on nodes like call_expression. Fall back to a
+	// tree-walk approach for those languages.
+	if config.name == "c" || config.name == "cpp" {
+		return extractRefsWalk(root, src, config, symbols)
+	}
+
 	q, err := gotreesitter.NewQuery(config.refQuery, config.lang)
 	if err != nil {
 		return nil
 	}
-
-	refNameIdx := captureIndex(q, "ref_name")
-	refIdx := captureIndex(q, "ref")
 
 	cursor := q.Exec(root, config.lang, src)
 
@@ -146,10 +164,10 @@ func extractRefs(root *gotreesitter.Node, src []byte, config *languageConfig, sy
 		var rname string
 		var refNode *gotreesitter.Node
 		for _, cap := range m.Captures {
-			if refNameIdx >= 0 && cap.Index == uint32(refNameIdx) {
+			if cap.Name == "ref_name" {
 				rname = cap.Node.Text(src)
 			}
-			if refIdx >= 0 && cap.Index == uint32(refIdx) {
+			if cap.Name == "ref" {
 				refNode = cap.Node
 			}
 		}
@@ -172,13 +190,33 @@ func extractRefs(root *gotreesitter.Node, src []byte, config *languageConfig, sy
 	return refs
 }
 
-func captureIndex(q *gotreesitter.Query, name string) int {
-	for i, n := range q.CaptureNames() {
-		if n == name {
-			return i
+// extractRefsWalk extracts call references by walking the AST and checking
+// parent node types. Used for grammars where query matching on compound
+// node types (like call_expression) is unreliable.
+func extractRefsWalk(root *gotreesitter.Node, src []byte, config *languageConfig, symbols []Symbol) []Ref {
+	var refs []Ref
+	var walk func(node *gotreesitter.Node)
+	walk = func(node *gotreesitter.Node) {
+		if node.Type(config.lang) == "identifier" {
+			parent := node.Parent()
+			if parent != nil && parent.Type(config.lang) == "call_expression" {
+				rname := node.Text(src)
+				containing := findContainingSymbol(symbols, parent.StartByte())
+				refs = append(refs, Ref{
+					RefName:          rname,
+					Kind:             "call",
+					Line:             int(parent.StartPoint().Row) + 1,
+					Col:              int(parent.StartPoint().Column) + 1,
+					ContainingSymIdx: containing,
+				})
+			}
+		}
+		for i := 0; i < node.ChildCount(); i++ {
+			walk(node.Child(i))
 		}
 	}
-	return -1
+	walk(root)
+	return refs
 }
 
 // findContainingSymbol finds the innermost symbol whose byte range contains byte_offset.
@@ -517,8 +555,9 @@ func getConfig(language string) *languageConfig {
 
 func goConfig() *languageConfig {
 	return &languageConfig{
-		name: "go",
-		lang: grammars.GoLanguage(),
+		name:               "go",
+		lang:               grammars.GoLanguage(),
+		tokenSourceFactory: grammars.NewGoTokenSourceOrEOF,
 		defQuery: `
 			(function_declaration name: (identifier) @name) @def
 			(method_declaration name: (field_identifier) @name) @def
@@ -571,8 +610,9 @@ func pythonConfig() *languageConfig {
 
 func javascriptConfig() *languageConfig {
 	return &languageConfig{
-		name: "javascript",
-		lang: grammars.JavascriptLanguage(),
+		name:               "javascript",
+		lang:               grammars.JavascriptLanguage(),
+		tokenSourceFactory: grammars.NewGenericTokenSourceOrEOF,
 		defQuery: `
 			(function_declaration name: (identifier) @name) @def
 			(class_declaration name: (identifier) @name) @def
@@ -587,8 +627,9 @@ func javascriptConfig() *languageConfig {
 
 func typescriptConfig() *languageConfig {
 	return &languageConfig{
-		name: "typescript",
-		lang: grammars.TypescriptLanguage(),
+		name:               "typescript",
+		lang:               grammars.TypescriptLanguage(),
+		tokenSourceFactory: grammars.NewGenericTokenSourceOrEOF,
 		defQuery: `
 			(function_declaration name: (identifier) @name) @def
 			(class_declaration name: (type_identifier) @name) @def
@@ -616,8 +657,9 @@ func tsxConfig() *languageConfig {
 
 func cConfig() *languageConfig {
 	return &languageConfig{
-		name: "c",
-		lang: grammars.CLanguage(),
+		name:               "c",
+		lang:               grammars.CLanguage(),
+		tokenSourceFactory: grammars.NewCTokenSourceOrEOF,
 		defQuery: `
 			(function_definition declarator: (function_declarator declarator: (identifier) @name)) @def
 			(struct_specifier name: (type_identifier) @name) @def
@@ -652,4 +694,171 @@ func cppConfig() *languageConfig {
 // SupportedLanguages returns the list of languages for which symbol extraction is available.
 func SupportedLanguages() []string {
 	return []string{"go", "rust", "python", "javascript", "typescript", "tsx", "jsx", "c", "cpp"}
+}
+
+// --- Regex-based fallback for languages where tree-sitter DFA lexer fails ---
+
+// regexPattern defines a regex pattern and its corresponding symbol kind.
+type regexPattern struct {
+	re   *regexp.Regexp
+	kind string
+}
+
+var rustRegexPatterns = []regexPattern{
+	{regexp.MustCompile(`(?m)^\s*(?:pub(?:\([\w:]+\))?\s+)?fn\s+(\w+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)(?:\s*->\s*(\S+(?:\s*<[^>]*>)?))?`), "function"},
+	{regexp.MustCompile(`(?m)^\s*(?:pub(?:\([\w:]+\))?\s+)?struct\s+(\w+)`), "struct"},
+	{regexp.MustCompile(`(?m)^\s*(?:pub(?:\([\w:]+\))?\s+)?enum\s+(\w+)`), "enum"},
+	{regexp.MustCompile(`(?m)^\s*(?:pub(?:\([\w:]+\))?\s+)?trait\s+(\w+)`), "trait"},
+	{regexp.MustCompile(`(?m)^\s*impl(?:\s*<[^>]*>)?\s+(\w+)`), "impl"},
+	{regexp.MustCompile(`(?m)^\s*(?:pub(?:\([\w:]+\))?\s+)?mod\s+(\w+)`), "module"},
+	{regexp.MustCompile(`(?m)^\s*(?:pub(?:\([\w:]+\))?\s+)?const\s+(\w+)`), "const"},
+	{regexp.MustCompile(`(?m)^\s*(?:pub(?:\([\w:]+\))?\s+)?static\s+(\w+)`), "static"},
+	{regexp.MustCompile(`(?m)^\s*(?:pub(?:\([\w:]+\))?\s+)?type\s+(\w+)`), "type_alias"},
+}
+
+var rustCallPattern = regexp.MustCompile(`(\w+)\s*(?:::<[^>]*>)?\(`)
+var rustMacroPattern = regexp.MustCompile(`(\w+)!\s*[\(\[\{]`)
+
+func extractRegexFallback(source, language string) ([]Symbol, []Ref) {
+	var patterns []regexPattern
+	switch language {
+	case "rust":
+		patterns = rustRegexPatterns
+	default:
+		return nil, nil
+	}
+
+	lines := strings.Split(source, "\n")
+	var symbols []Symbol
+
+	for _, pat := range patterns {
+		for _, loc := range pat.re.FindAllStringIndex(source, -1) {
+			matchStr := source[loc[0]:loc[1]]
+			submatch := pat.re.FindStringSubmatch(matchStr)
+			if len(submatch) < 2 {
+				continue
+			}
+
+			name := submatch[1]
+			line := strings.Count(source[:loc[0]], "\n") + 1
+
+			var sig, retType, params string
+			sig = collapseWhitespace(strings.TrimSpace(matchStr))
+			if pat.kind == "function" {
+				if len(submatch) > 2 {
+					params = strings.TrimSpace(submatch[2])
+				}
+				if len(submatch) > 3 {
+					retType = strings.TrimSpace(submatch[3])
+				}
+			}
+
+			symbols = append(symbols, Symbol{
+				Name:       name,
+				Kind:       pat.kind,
+				Line:       line,
+				Col:        loc[0] - strings.LastIndex(source[:loc[0]], "\n"),
+				EndLine:    line,
+				EndCol:     loc[0] - strings.LastIndex(source[:loc[0]], "\n") + len(matchStr),
+				ParentIdx:  -1,
+				Signature:  sig,
+				ReturnType: retType,
+				Params:     params,
+			})
+		}
+	}
+
+	// Sort by line
+	sort.Slice(symbols, func(i, j int) bool {
+		return symbols[i].Line < symbols[j].Line
+	})
+
+	// Determine nesting: impl blocks contain methods
+	// Simple heuristic: track indent levels
+	for i := range symbols {
+		if symbols[i].Kind == "function" && symbols[i].Line > 1 {
+			lineText := lines[symbols[i].Line-1]
+			indent := len(lineText) - len(strings.TrimLeft(lineText, " \t"))
+			if indent >= 4 {
+				// Find nearest preceding impl/trait/struct
+				for j := i - 1; j >= 0; j-- {
+					if symbols[j].Kind == "impl" || symbols[j].Kind == "trait" {
+						symbols[i].ParentIdx = j
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Extract call references
+	var refs []Ref
+	for _, loc := range rustCallPattern.FindAllStringIndex(source, -1) {
+		matchStr := source[loc[0]:loc[1]]
+		sub := rustCallPattern.FindStringSubmatch(matchStr)
+		if len(sub) < 2 {
+			continue
+		}
+		name := sub[1]
+		// Skip keywords
+		if isRustKeyword(name) {
+			continue
+		}
+		line := strings.Count(source[:loc[0]], "\n") + 1
+		containing := -1
+		for si := len(symbols) - 1; si >= 0; si-- {
+			if symbols[si].Kind == "function" && symbols[si].Line <= line {
+				containing = si
+				break
+			}
+		}
+		refs = append(refs, Ref{
+			RefName:          name,
+			Kind:             "call",
+			Line:             line,
+			Col:              loc[0] - strings.LastIndex(source[:loc[0]], "\n"),
+			ContainingSymIdx: containing,
+		})
+	}
+
+	// Macro invocations
+	for _, loc := range rustMacroPattern.FindAllStringIndex(source, -1) {
+		matchStr := source[loc[0]:loc[1]]
+		sub := rustMacroPattern.FindStringSubmatch(matchStr)
+		if len(sub) < 2 {
+			continue
+		}
+		name := sub[1]
+		if isRustKeyword(name) {
+			continue
+		}
+		line := strings.Count(source[:loc[0]], "\n") + 1
+		containing := -1
+		for si := len(symbols) - 1; si >= 0; si-- {
+			if symbols[si].Kind == "function" && symbols[si].Line <= line {
+				containing = si
+				break
+			}
+		}
+		refs = append(refs, Ref{
+			RefName:          name,
+			Kind:             "call",
+			Line:             line,
+			Col:              loc[0] - strings.LastIndex(source[:loc[0]], "\n"),
+			ContainingSymIdx: containing,
+		})
+	}
+
+	return symbols, refs
+}
+
+func isRustKeyword(s string) bool {
+	switch s {
+	case "if", "else", "for", "while", "loop", "match", "return", "let", "mut",
+		"fn", "pub", "use", "mod", "struct", "enum", "trait", "impl", "where",
+		"self", "super", "crate", "as", "in", "ref", "move", "async", "await",
+		"dyn", "type", "const", "static", "unsafe", "extern":
+		return true
+	}
+	return false
 }

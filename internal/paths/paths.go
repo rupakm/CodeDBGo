@@ -32,7 +32,7 @@ func xdgDataHome() string {
 }
 
 // DataDir returns the persistent data directory for CodeDB.
-// Default: ~/.local/share/sageox/codedb
+// Default: ~/.local/share/codedb
 func DataDir() string {
-	return filepath.Join(xdgDataHome(), "sageox", "codedb")
+	return filepath.Join(xdgDataHome(), "codedb")
 }

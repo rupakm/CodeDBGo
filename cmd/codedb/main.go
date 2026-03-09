@@ -26,7 +26,7 @@ var rootCmd = &cobra.Command{
 	Long: `CodeDB indexes git repositories into SQLite + Bleve full-text search,
 supports Sourcegraph-style queries, and extracts symbols.
 
-Data stored at: ~/.local/share/sageox/codedb/`,
+Data stored at: ~/.local/share/codedb/`,
 }
 
 // indexCmd: codedb index <url>

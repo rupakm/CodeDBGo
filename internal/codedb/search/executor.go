@@ -8,6 +8,7 @@ import (
 
 	"github.com/blevesearch/bleve/v2"
 	blevesearch "github.com/blevesearch/bleve/v2/search"
+	_ "github.com/blevesearch/bleve/v2/search/highlight/highlighter/ansi" // register ansi highlighter
 
 	"github.com/sageox/codedbgo/internal/codedb/store"
 )

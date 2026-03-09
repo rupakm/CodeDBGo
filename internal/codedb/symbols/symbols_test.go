@@ -442,3 +442,336 @@ func TestSignatureExtraction(t *testing.T) {
 		t.Errorf("signature = %q", symbols[0].Signature)
 	}
 }
+
+func TestPythonMethodCallAndNesting(t *testing.T) {
+	source := `class Animal:
+    def speak(self):
+        self.make_sound()
+
+    def make_sound(self):
+        print("...")
+
+class Dog(Animal):
+    def make_sound(self):
+        print("woof")
+
+def train(animal):
+    animal.speak()
+`
+	symbols, refs := Extract(source, "python")
+
+	// Verify all symbols exist with correct kinds
+	want := map[string]string{
+		"Animal":     "class",
+		"speak":      "function",
+		"make_sound": "function",
+		"Dog":        "class",
+		"train":      "function",
+	}
+	found := map[string]bool{}
+	for _, s := range symbols {
+		if expectedKind, ok := want[s.Name]; ok {
+			if s.Kind != expectedKind {
+				t.Errorf("%s kind = %q, want %q", s.Name, s.Kind, expectedKind)
+			}
+			found[s.Name] = true
+		}
+	}
+	for name := range want {
+		if !found[name] {
+			t.Errorf("missing symbol %q", name)
+		}
+	}
+
+	// speak and make_sound should be nested inside their class
+	for _, s := range symbols {
+		if s.Name == "speak" {
+			if s.ParentIdx < 0 || symbols[s.ParentIdx].Name != "Animal" {
+				t.Errorf("speak should be nested in Animal")
+			}
+		}
+		if s.Name == "train" && s.ParentIdx >= 0 {
+			t.Error("train should be top-level (no parent)")
+		}
+	}
+
+	// make_sound should appear twice (Animal and Dog)
+	makeSoundCount := 0
+	for _, s := range symbols {
+		if s.Name == "make_sound" {
+			makeSoundCount++
+		}
+	}
+	if makeSoundCount != 2 {
+		t.Errorf("expected 2 make_sound symbols, got %d", makeSoundCount)
+	}
+
+	// print() should be referenced
+	var printRefs []Ref
+	for _, r := range refs {
+		if r.RefName == "print" {
+			printRefs = append(printRefs, r)
+		}
+	}
+	if len(printRefs) < 2 {
+		t.Errorf("expected at least 2 print refs, got %d", len(printRefs))
+	}
+}
+
+func TestGoMethodsAndTypes(t *testing.T) {
+	source := `package main
+
+type Server struct {
+	port int
+}
+
+func NewServer(port int) *Server {
+	return &Server{port: port}
+}
+
+func (s *Server) Start() error {
+	return s.listen()
+}
+
+func (s *Server) listen() error {
+	return nil
+}
+
+type Handler interface{}
+`
+	symbols, refs := Extract(source, "go")
+
+	// Check all symbols
+	want := map[string]string{
+		"Server":    "type",
+		"NewServer": "function",
+		"Start":     "method",
+		"listen":    "method",
+		"Handler":   "type",
+	}
+	found := map[string]bool{}
+	for _, s := range symbols {
+		if expectedKind, ok := want[s.Name]; ok {
+			if s.Kind != expectedKind {
+				t.Errorf("%s kind = %q, want %q", s.Name, s.Kind, expectedKind)
+			}
+			found[s.Name] = true
+		}
+	}
+	for name := range want {
+		if !found[name] {
+			t.Errorf("missing symbol %q", name)
+		}
+	}
+
+	// NewServer should have return type *Server and params
+	for _, s := range symbols {
+		if s.Name == "NewServer" {
+			if s.Params != "port int" {
+				t.Errorf("NewServer params = %q, want %q", s.Params, "port int")
+			}
+			if s.ReturnType != "*Server" {
+				t.Errorf("NewServer return_type = %q, want %q", s.ReturnType, "*Server")
+			}
+		}
+		if s.Name == "Start" {
+			if s.ReturnType != "error" {
+				t.Errorf("Start return_type = %q, want %q", s.ReturnType, "error")
+			}
+		}
+	}
+
+	// s.listen() should be a ref inside Start
+	var listenRefs []Ref
+	for _, r := range refs {
+		if r.RefName == "listen" {
+			listenRefs = append(listenRefs, r)
+		}
+	}
+	if len(listenRefs) != 1 {
+		t.Fatalf("expected 1 listen ref, got %d", len(listenRefs))
+	}
+	startIdx := -1
+	for i, s := range symbols {
+		if s.Name == "Start" {
+			startIdx = i
+		}
+	}
+	if listenRefs[0].ContainingSymIdx != startIdx {
+		t.Errorf("listen() containingSymIdx = %d, want %d (Start)", listenRefs[0].ContainingSymIdx, startIdx)
+	}
+}
+
+func TestRustEnumAndTraits(t *testing.T) {
+	source := `enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+trait Drawable {
+    fn draw(&self);
+}
+
+struct Circle {
+    radius: f64,
+}
+
+impl Drawable for Circle {
+    fn draw(&self) {
+        render(self.radius);
+    }
+}
+
+fn render(r: f64) {
+    println!("drawing circle with radius {}", r);
+}
+`
+	symbols, refs := Extract(source, "rust")
+
+	type wantSym struct{ name, kind string }
+	wantList := []wantSym{
+		{"Color", "enum"},
+		{"Drawable", "trait"},
+		{"Circle", "struct"},
+		{"Circle", "impl"},
+		{"draw", "function"},
+		{"render", "function"},
+	}
+	for _, w := range wantList {
+		found := false
+		for _, s := range symbols {
+			if s.Name == w.name && s.Kind == w.kind {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("missing symbol %s/%s", w.name, w.kind)
+		}
+	}
+
+	// draw should be nested in an impl
+	for _, s := range symbols {
+		if s.Name == "draw" {
+			if s.ParentIdx < 0 {
+				t.Error("draw should be nested inside impl")
+			}
+		}
+	}
+
+	// render() call inside draw
+	var renderRefs []Ref
+	for _, r := range refs {
+		if r.RefName == "render" {
+			renderRefs = append(renderRefs, r)
+		}
+	}
+	if len(renderRefs) != 1 {
+		t.Fatalf("expected 1 render ref, got %d", len(renderRefs))
+	}
+	drawIdx := -1
+	for i, s := range symbols {
+		if s.Name == "draw" {
+			drawIdx = i
+		}
+	}
+	if renderRefs[0].ContainingSymIdx != drawIdx {
+		t.Errorf("render() containingSymIdx = %d, want %d (draw)", renderRefs[0].ContainingSymIdx, drawIdx)
+	}
+
+	// println! macro ref
+	var printlnRefs []Ref
+	for _, r := range refs {
+		if r.RefName == "println" {
+			printlnRefs = append(printlnRefs, r)
+		}
+	}
+	if len(printlnRefs) != 1 {
+		t.Errorf("expected 1 println! ref, got %d", len(printlnRefs))
+	}
+}
+
+func TestTypescriptClassesAndInterfaces(t *testing.T) {
+	source := `interface Logger {
+    log(message: string): void;
+}
+
+class ConsoleLogger implements Logger {}
+
+enum Level {
+    Debug,
+    Info,
+    Error,
+}
+
+type Config = {
+    level: Level;
+    logger: Logger;
+};
+
+function createLogger(config: Config): Logger {
+    return new ConsoleLogger();
+}
+
+function useLogger(logger: Logger): void {
+    createLogger(logger);
+}
+`
+	symbols, refs := Extract(source, "typescript")
+
+	want := map[string]string{
+		"Logger":        "interface",
+		"ConsoleLogger": "class",
+		"Level":         "enum",
+		"Config":        "type_alias",
+		"createLogger":  "function",
+		"useLogger":     "function",
+	}
+	found := map[string]bool{}
+	for _, s := range symbols {
+		if expectedKind, ok := want[s.Name]; ok {
+			if s.Kind != expectedKind {
+				t.Errorf("%s kind = %q, want %q", s.Name, s.Kind, expectedKind)
+			}
+			found[s.Name] = true
+		}
+	}
+	for name := range want {
+		if !found[name] {
+			t.Errorf("missing symbol %q", name)
+		}
+	}
+
+	// createLogger should have return type and params
+	for _, s := range symbols {
+		if s.Name == "createLogger" {
+			if s.ReturnType != "Logger" {
+				t.Errorf("createLogger return_type = %q, want Logger", s.ReturnType)
+			}
+			if s.Params != "config: Config" {
+				t.Errorf("createLogger params = %q, want %q", s.Params, "config: Config")
+			}
+		}
+	}
+
+	// createLogger() call ref inside useLogger
+	var createRefs []Ref
+	for _, r := range refs {
+		if r.RefName == "createLogger" {
+			createRefs = append(createRefs, r)
+		}
+	}
+	if len(createRefs) != 1 {
+		t.Fatalf("expected 1 createLogger ref, got %d", len(createRefs))
+	}
+	useLoggerIdx := -1
+	for i, s := range symbols {
+		if s.Name == "useLogger" {
+			useLoggerIdx = i
+		}
+	}
+	if createRefs[0].ContainingSymIdx != useLoggerIdx {
+		t.Errorf("createLogger() containingSymIdx = %d, want %d (useLogger)", createRefs[0].ContainingSymIdx, useLoggerIdx)
+	}
+}
