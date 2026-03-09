@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/sageox/codedbgo/internal/codedb/index"
+	"github.com/sageox/codedbgo/internal/codedb/match"
 	"github.com/sageox/codedbgo/internal/codedb/search"
 	"github.com/sageox/codedbgo/internal/codedb/store"
 )
@@ -60,6 +61,11 @@ func (db *DB) TranslateQuery(input string) (*search.TranslatedQuery, error) {
 		return nil, err
 	}
 	return search.Translate(query)
+}
+
+// Match runs a structural pattern match against indexed code.
+func (db *DB) Match(ctx context.Context, opts match.MatchOptions) ([]match.MatchResult, error) {
+	return match.Execute(ctx, db.store, opts)
 }
 
 // RawSQL executes a raw SQL query and returns results as column-value pairs.

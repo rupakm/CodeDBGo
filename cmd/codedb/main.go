@@ -11,6 +11,7 @@ import (
 
 	"github.com/sageox/codedbgo/internal/codedb"
 	"github.com/sageox/codedbgo/internal/codedb/index"
+	"github.com/sageox/codedbgo/internal/codedb/match"
 	"github.com/sageox/codedbgo/internal/codedb/search"
 	"github.com/sageox/codedbgo/internal/paths"
 )
@@ -76,6 +77,35 @@ var sqlCmd = &cobra.Command{
 	RunE:  runSQL,
 }
 
+// matchCmd: codedb match <pattern>
+var matchCmd = &cobra.Command{
+	Use:   "match <pattern>",
+	Short: "Find structural code patterns using AST matching",
+	Long: `Find structural code patterns across indexed repositories.
+
+Patterns look like code with metavariables ($X) and ellipsis (...).
+
+Examples:
+  codedb match 'foo($X, ..., $X)' --lang python
+  codedb match '$X = $X' --lang go
+  codedb match 'eval($X)' --lang typescript --not 'eval("...")'
+  codedb match 'os.system($CMD)' --lang python --where '$CMD ~ /^"/' `,
+	Args: cobra.ExactArgs(1),
+	RunE: runMatch,
+}
+
+var matchFlags struct {
+	lang      string
+	repo      string
+	file      string
+	notPats   []string
+	inside    []string
+	notInside []string
+	where     []string
+	jsonOut   bool
+	count     int
+}
+
 func init() {
 	// Global flags
 	rootCmd.PersistentFlags().StringVar(&rootFlags.root, "root", paths.DataDir(), "data directory")
@@ -88,10 +118,23 @@ func init() {
 	searchCmd.Flags().BoolVar(&searchFlags.jsonOutput, "json", false, "output results as JSON")
 	searchCmd.Flags().IntVar(&searchFlags.count, "count", 0, "override result count limit")
 
+	// Match flags
+	matchCmd.Flags().StringVar(&matchFlags.lang, "lang", "", "target language (required)")
+	matchCmd.MarkFlagRequired("lang")
+	matchCmd.Flags().StringVar(&matchFlags.repo, "repo", "", "filter to repository")
+	matchCmd.Flags().StringVar(&matchFlags.file, "file", "", "filter to file glob")
+	matchCmd.Flags().StringSliceVar(&matchFlags.notPats, "not", nil, "exclude pattern (repeatable)")
+	matchCmd.Flags().StringSliceVar(&matchFlags.inside, "inside", nil, "require inside pattern (repeatable)")
+	matchCmd.Flags().StringSliceVar(&matchFlags.notInside, "not-inside", nil, "exclude inside pattern (repeatable)")
+	matchCmd.Flags().StringSliceVar(&matchFlags.where, "where", nil, "metavar constraint (repeatable)")
+	matchCmd.Flags().BoolVar(&matchFlags.jsonOut, "json", false, "JSON output")
+	matchCmd.Flags().IntVar(&matchFlags.count, "count", 0, "max results")
+
 	// Register subcommands
 	rootCmd.AddCommand(indexCmd)
 	rootCmd.AddCommand(searchCmd)
 	rootCmd.AddCommand(sqlCmd)
+	rootCmd.AddCommand(matchCmd)
 
 	// Silence cobra's default error/usage behavior
 	rootCmd.SilenceErrors = true
@@ -216,6 +259,52 @@ func runSearch(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	return nil
+}
+
+func runMatch(cmd *cobra.Command, args []string) error {
+	db, err := openDB()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	opts := match.MatchOptions{
+		Pattern:       args[0],
+		Lang:          matchFlags.lang,
+		Repo:          matchFlags.repo,
+		File:          matchFlags.file,
+		NotPats:       matchFlags.notPats,
+		InsidePats:    matchFlags.inside,
+		NotInsidePats: matchFlags.notInside,
+		WhereClauses:  matchFlags.where,
+		MaxResults:    matchFlags.count,
+		JSONOutput:    matchFlags.jsonOut,
+	}
+
+	results, err := db.Match(cmd.Context(), opts)
+	if err != nil {
+		return err
+	}
+
+	if len(results) == 0 {
+		fmt.Fprintln(cmd.OutOrStdout(), "No matches found.")
+		return nil
+	}
+
+	if matchFlags.jsonOut {
+		enc := json.NewEncoder(cmd.OutOrStdout())
+		enc.SetIndent("", "  ")
+		return enc.Encode(results)
+	}
+
+	for _, r := range results {
+		fmt.Fprintf(cmd.OutOrStdout(), "%s:%d:%d: %s\n", r.File, r.Line, r.Col, r.Text)
+		for name, val := range r.Bindings {
+			fmt.Fprintf(cmd.OutOrStdout(), "  $%s = %q\n", name, val)
+		}
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "\n%d matches found\n", len(results))
 	return nil
 }
 
